@@ -78,6 +78,9 @@ export class GameView implements GameMap {
   private _unitStates = new Map<number, import("../render/types").UnitState>();
   private updatedTiles: TileRef[] = [];
   private updatedTerrainTiles: TileRef[] = [];
+  // Per-tick packed tile updates ([ref, state, ref, state, ...]) buffered for
+  // drip-application across render frames. Drains via drainPendingTileUpdates.
+  private _pendingTileUpdates: number[] = [];
 
   // ── FrameData accumulators (renderer-bound state) ─────────────────────
   private trailManager!: TrailManager;
@@ -271,13 +274,24 @@ export class GameView implements GameMap {
     this.updatedTiles = [];
     this.updatedTerrainTiles = [];
     const packed = this.lastUpdate.packedTileUpdates;
-    for (let i = 0; i + 1 < packed.length; i += 2) {
-      const tile = packed[i];
-      const state = packed[i + 1];
-      const terrainChanged = this.updateTile(tile, state);
-      this.updatedTiles.push(tile);
-      if (terrainChanged) {
-        this.updatedTerrainTiles.push(tile);
+    if (this._firstPopulate) {
+      // First tick triggers a full upload; apply immediately so the GPU starts
+      // from the same state the renderer is about to dump.
+      for (let i = 0; i + 1 < packed.length; i += 2) {
+        const tile = packed[i];
+        const state = packed[i + 1];
+        const terrainChanged = this.updateTile(tile, state);
+        this.updatedTiles.push(tile);
+        if (terrainChanged) {
+          this.updatedTerrainTiles.push(tile);
+        }
+      }
+    } else {
+      // Defer to drainPendingTileUpdates() called per render frame. Spreads
+      // the tick's tile updates over ~6 frames so territory changes animate
+      // instead of teleporting once per tick.
+      for (let i = 0; i < packed.length; i++) {
+        this._pendingTileUpdates.push(packed[i]);
       }
     }
 
@@ -433,9 +447,16 @@ export class GameView implements GameMap {
     );
 
     // Changed-tile delta refs (zero-copy: state field unused in live mode).
-    this._changedTilesScratch.length = 0;
-    for (let i = 0; i < this.updatedTiles.length; i++) {
-      this._changedTilesScratch.push({ ref: this.updatedTiles[i], state: 0 });
+    // After firstPopulate, drainPendingTileUpdates() owns this buffer — it
+    // refills it per render frame with only the tiles drained that frame.
+    if (this._firstPopulate) {
+      this._changedTilesScratch.length = 0;
+      for (let i = 0; i < this.updatedTiles.length; i++) {
+        this._changedTilesScratch.push({
+          ref: this.updatedTiles[i],
+          state: 0,
+        });
+      }
     }
 
     // Names map — rebuilt every tick. Cheap (one entry per player, no big
@@ -1074,6 +1095,38 @@ export class GameView implements GameMap {
   }
   updateTile(tile: TileRef, state: number): boolean {
     return this._map.updateTile(tile, state);
+  }
+
+  /** Number of tile updates buffered for drip-application. */
+  pendingTileUpdateCount(): number {
+    return this._pendingTileUpdates.length >> 1;
+  }
+
+  /**
+   * Apply up to `maxPairs` queued tile updates to the tileState buffer in FIFO
+   * order. Refills _changedTilesScratch with only the pairs applied this call
+   * so the renderer's per-frame delta upload sees just those dirty rows.
+   * Returns true if any pairs were applied.
+   */
+  drainPendingTileUpdates(maxPairs: number): boolean {
+    const pending = this._pendingTileUpdates;
+    if (pending.length === 0 || maxPairs <= 0) {
+      if (this._changedTilesScratch.length > 0) {
+        this._changedTilesScratch.length = 0;
+      }
+      return false;
+    }
+    const pairsToDrain = Math.min(maxPairs, pending.length >> 1);
+    const itemsToDrain = pairsToDrain * 2;
+    this._changedTilesScratch.length = 0;
+    for (let i = 0; i < itemsToDrain; i += 2) {
+      const tile = pending[i];
+      const state = pending[i + 1];
+      this.updateTile(tile, state);
+      this._changedTilesScratch.push({ ref: tile, state: 0 });
+    }
+    pending.splice(0, itemsToDrain);
+    return true;
   }
   numTilesWithFallout(): number {
     return this._map.numTilesWithFallout();

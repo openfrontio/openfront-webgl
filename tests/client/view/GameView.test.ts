@@ -377,6 +377,10 @@ describe("GameView.frameData() — renderer contract", () => {
     const gu2 = makeEmptyGu(2);
     gu2.packedTileUpdates = new Uint32Array([3, 0, 5, 0, 9, 0]);
     game.update(gu2);
+    // Tile updates are queued for drip-application across render frames; the
+    // per-tick frame data leaves changedTiles empty until drain runs.
+    expect(game.pendingTileUpdateCount()).toBe(3);
+    game.drainPendingTileUpdates(3);
     const ct = game.frameData().changedTiles;
     expect(ct).not.toBeNull();
     expect(ct!.map((t) => t.ref).sort((a, b) => a - b)).toEqual([3, 5, 9]);

@@ -357,11 +357,30 @@ function mountWebGLFrameLoop(
     view.showMoveIndicator(tx, ty, firstUnit.owner().smallID());
   });
 
+  // Tile updates arrive once per simulation tick (10Hz) but the renderer
+  // draws at 60fps. Without smoothing, all the tick's tile changes appear at
+  // once — territory expansion teleports in chunks. Spread the drain across
+  // multiple tick windows: each frame drains ceil(queue / FRAMES_PER_TICK)
+  // pairs. Larger values smooth more but introduce visible sim-to-render lag
+  // when the front is changing heavily.
+  const FRAMES_PER_TICK = 24;
+  const drainTileUpdates = (): void => {
+    const pending = gameView.pendingTileUpdateCount();
+    if (pending === 0) return;
+    const budget = Math.ceil(pending / FRAMES_PER_TICK);
+    if (!gameView.drainPendingTileUpdates(budget)) return;
+    const changed = gameView.frameData().changedTiles;
+    if (changed && changed.length > 0) {
+      view.uploadLiveDelta(gameView.tileStateBuffer(), changed);
+    }
+  };
+
   // Self-driving RAF: syncCamera reads the latest camera state from
   // TransformHandler, pushes it to WebGL, and synchronously invokes the
   // renderer's captured frame callback (which draws). One RAF = one
   // synchronized camera-update + WebGL render.
   const driveFrame = (): void => {
+    drainTileUpdates();
     syncCamera();
     requestAnimationFrame(driveFrame);
   };
